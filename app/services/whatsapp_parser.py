@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple
 
 from dateutil import parser as dateparser
 
-from telegram_parser import TelegramMessage
+from .telegram_parser import TelegramMessage
 
 # Форматы строк WhatsApp:
 # 1) [07/04/2018, 14:11:22] Mike: Hi
