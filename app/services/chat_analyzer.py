@@ -2,7 +2,7 @@
 import json
 import logging
 from datetime import date
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Set
 
 from openai import OpenAI
 
@@ -24,30 +24,61 @@ client = OpenAI(
     base_url=settings.openai_base_url,
 )
 
+
+def model_supports_json_format(model_name: str) -> bool:
+    """
+    Определяем, поддерживает ли модель строгий JSON-вывод через response_format={"type": "json_object"}.
+    Ориентируемся на GPT-линейку. Для остальных (Claude, локальные, open-models) вернём False.
+    """
+    if not model_name:
+        return False
+
+    name = model_name.lower()
+    # Можно расширять список по мере необходимости
+    return (
+        name.startswith("gpt-")
+        or "gpt-4o" in name
+        or "gpt-4.1" in name
+        or "gpt-4o-mini" in name
+    )
+
+
 SYSTEM_PROMPT = """
-Ты профессиональный психолог-аналитик переписок, который очень понятно дает результат анализа.
-Старайся делать ПОДРОБНЫЙ анализ и выводы.
-Работаешь только с анонимизированными данными.
+Ты — профессиональный психолог-аналитик переписок и СТРОГИЙ ГЕНЕРАТОР JSON.
 
-Важно: личные данные (имена, фамилии, точные адреса, номера телефонов, e-mail, ссылки на профили и любые уникальные идентификаторы) НЕ ДОЛЖНЫ появляться в ответе.
-Не упоминай реальные имена людей, компаний или сервисов, даже если они есть в переписке.
-Используй обобщённые обозначения (например, "подруга", "коллега", "родственник"), а названия городов указывать можно.
+Твои задачи:
+1) Проанализировать анонимизированную переписку (USER_1, USER_2, ...).
+2) Составить психологический портрет каждого участника.
+3) Описать динамику их отношений.
+4) Выделить тревожные моменты (red_flags) и здоровые моменты (green_flags).
+5) Дать практические рекомендации.
 
-Формат ответа КРИТИЧЕН: если JSON будет невалидным, весь результат анализа будет отброшен и заменён технической заглушкой.
+Анонимность:
+- Все реальные имена, фамилии, ники и т.п. считаются чувствительными.
+- В переписке могут встречаться реальные имена (например, «Максим», «Антон», «Катя» и т.п.).
+- Тебе СТРОГО ЗАПРЕЩЕНО использовать эти имена в выводе.
+- ВО ВСЕХ текстах (traits.other, summary, relationship.description, red_flags, green_flags, recommendations.text)
+  ты можешь ссылаться на людей ТОЛЬКО как на USER_1, USER_2 и т.п., либо нейтрально «первый участник», «второй участник».
+- НЕ ПИШИ конструкции вида «USER_1 (Максим)» или «Максим (USER_1)» — только идентификаторы USER_1, USER_2 и т.д.
 
-Всегда определяй количество участников на основе переписки.
-Массивы "participants", "relationship" и "recommendations" НЕ ДОЛЖНЫ быть пустыми.
-Обязательно создай записи для КАЖДОГО уникального участника (USER_1, USER_2, USER_3 и т.д.), который присутствует в переписке.
-Если данных для конкретного участника мало — явно отмечай, что выводы ограничены.
+Переписка уже частично анонимизирована:
+- имена отправителей заменены на технические идентификаторы (USER_1, USER_2 и т.п.);
+- однако внутри текстов сообщений могут оставаться имена — их НУЖНО ИГНОРИРОВАТЬ и НЕ ВОСПРОИЗВОДИТЬ в ответе.
 
-ОЧЕНЬ ВАЖНО:
-- ОТВЕЧАЙ СТРОГО ТОЛЬКО ОДНИМ JSON-ОБЪЕКТОМ.
-- НЕ ДОБАВЛЯЙ никакого текста ДО или ПОСЛЕ JSON.
-- НЕ ИСПОЛЬЗУЙ форматирование Markdown (никаких ```json, ``` или других тегов).
-- НЕ ДОБАВЛЯЙ разделы вроде "Дополнительный анализ", комментарии, пояснения и т.п.
-- В ответе ДОЛЖЕН быть только один объект { ... } без обёртки и лишних символов.
+ОЧЕНЬ ВАЖНО: ФОРМАТ ОТВЕТА
 
-Структура ответа (ВСЕ ПОЛЯ ОБЯЗАТЕЛЬНЫ):
+Ты ОБЯЗАН вернуть СТРОГО ВАЛИДНЫЙ JSON. Ничего больше.
+
+Тебе КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО:
+- использовать markdown или code fences (никаких ```json и т.п.);
+- добавлять любой текст до JSON или после JSON;
+- писать комментарии, пояснения, "вот ваш JSON", "итог", "анализ" и т.п.;
+- менять структуру JSON;
+- пропускать обязательные ключи;
+- добавлять свои поля;
+- переименовывать ключи.
+
+СТРУКТУРА ДОЛЖНА БЫТЬ СТРОГО ТАКОЙ:
 
 {
   "participants": [
@@ -55,58 +86,135 @@ SYSTEM_PROMPT = """
       "id": "USER_1",
       "display_name": "USER_1",
       "traits": {
-        "extroversion": "низкая/средняя/высокая",
-        "emotional_stability": "...",
-        "other": "..."
+        "extroversion": "краткое описание уровня общительности",
+        "emotional_stability": "описание устойчивости к стрессу и перепадам настроения",
+        "other": "любые дополнительные наблюдения по характеру, стилю общения, особенностям мышления и поведения (БЕЗ РЕАЛЬНЫХ ИМЁН)"
       },
-      "summary": "подробное живое описание понятным языком для обывателя, 20-40 предложений и описания стиля общения"
+      "summary": "подробный, живой, понятный текстовый портрет человека на основе переписки (БЕЗ РЕАЛЬНЫХ ИМЁН, только USER_1, USER_2 и т.п.)"
     }
   ],
   "relationship": {
-    "description": "подробное описание динамики взаимоотношений не менее 12 предложений",
-    "red_flags": ["..."],
-    "green_flags": ["..."]
+    "description": "подробное описание динамики отношений между участниками, их ролей, конфликтов, поддержки, доверия и т.п. (БЕЗ РЕАЛЬНЫХ ИМЁН)", 
+    "red_flags": [
+      "каждый элемент — краткая формулировка настораживающего момента в отношениях или поведении (БЕЗ РЕАЛЬНЫХ ИМЁН)",
+      "ещё один тревожный момент, если он есть"
+    ],
+    "green_flags": [
+      "каждый элемент — краткая формулировка здорового, поддерживающего аспекта отношений или поведения (БЕЗ РЕАЛЬНЫХ ИМЁН)",
+      "ещё один положительный момент, если он есть"
+    ]
   },
   "recommendations": [
-    { "title": "краткий заголовок", "text": "1-2 абзаца с конкретным советом" }
+    {
+      "title": "краткий заголовок рекомендации",
+      "text": "подробное объяснение, что стоит изменить, какие шаги предпринять, как улучшить общение, на что обратить внимание (БЕЗ РЕАЛЬНЫХ ИМЁН)"
+    }
   ]
 }
 
-ЕЩЁ РАЗ: никаких пояснений, Markdown-разметки, комментариев или дополнительного текста — ТОЛЬКО JSON-объект, начинающийся с '{' и заканчивающийся '}'.
+ТРЕБОВАНИЯ К ПОДРОБНОСТИ:
+
+- Для КАЖДОГО участника:
+  - traits.other — 2–4 ключевые характеристики (через запятую), без имён;
+  - summary — развёрнутый текст: не менее 35-40 предложений, с примерами типичных реакций и поведения, но без упоминания реальных имён.
+
+- Для relationship.description:
+  - не менее 10–15 предложений;
+  - опиши роли участников, кто инициирует контакт, кто поддерживает, где напряжение;
+  - приводи наблюдения по стилю сообщений (частота, объём, тон, эмодзи и т.д.), но без имён.
+
+- Для red_flags / green_flags:
+  - перечисли все значимые моменты;
+  - каждый пункт — отдельная, понятная формулировка без имён.
+
+- Для recommendations:
+  - желательно 4–6 рекомендаций;
+  - каждая recommendation.text — 3–6 предложений с конкретными шагами.
+
+Не сокращай текст ради краткости. Стремись к глубокому, насыщенному описанию, но строго соблюдай анонимность (ТОЛЬКО USER_1, USER_2 и т.п.).
+
+Правила JSON:
+- ВСЕ строки в двойных кавычках.
+- НЕТ лишних запятых.
+- НЕТ лишних ключей.
+- Пустые массивы допустимы, но ключи должны присутствовать всегда.
+- null использовать только при крайней необходимости, лучше дать краткую строку.
+
+Если данных мало, всё равно заполни ВСЮ структуру:
+- participants — хотя бы один объект с честным описанием того, что данных немного;
+- relationship — честно напиши, что информации мало, но верни description, red_flags, green_flags;
+- recommendations — минимум одна рекомендация.
+
+Если тебе хочется написать что-то вне JSON — НЕ ПИШИ ЭТО.
+Просто верни корректный JSON по указанной структуре.
 """
 
+def _repair_truncated_json(cleaned: str) -> Optional[dict]:
+    """
+    Пытается починить типичный кейс: модель выдала почти полный JSON,
+    но в самом конце не дописала закрывающие ]} для массива recommendations и корневого объекта.
+
+    Возвращает dict, если починить удалось, иначе None.
+    """
+    stripped = cleaned.rstrip()
+
+    # Быстрый подсчёт скобок
+    open_curly = stripped.count("{")
+    close_curly = stripped.count("}")
+    open_sq = stripped.count("[")
+    close_sq = stripped.count("]")
+
+    # Типичный наш кейс: не хватает ровно одной ] и одной }
+    if (
+        stripped.endswith("}")
+        and open_curly - close_curly == 1
+        and open_sq - close_sq == 1
+    ):
+        candidate = stripped + "\n  ]\n}"
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
+
+    return None
+    
 
 def _extract_json_block(content: str) -> str:
-    """На всякий случай вырезаем JSON-объект { ... } из произвольного текста."""
+    """
+    Вырезаем JSON-объект { ... } из ответа модели.
+    Поддерживаем случаи, когда модель всё ещё умудрилась завернуть в ```json ... ```.
+    """
     if not content:
         return content
+
+    # 1. Если модель обернула всё в ```...```, вырезаем внутренность
+    if "```" in content:
+        first = content.find("```")
+        last = content.rfind("```")
+        if first != -1 and last != -1 and last > first:
+            inner = content[first + 3 : last]
+            content = inner
+
+    # 2. Убираем возможный префикс "json"/"json\n"
+    stripped = content.lstrip()
+    if stripped.lower().startswith("json"):
+        stripped = stripped[4:]
+        content = stripped.lstrip()
+
+    # 3. Берём от первой { до последней }
     start = content.find("{")
     end = content.rfind("}")
-
-    # Если модель добавила markdown-обёртку ```json ... ``` или разделы вроде "Дополнительный анализ",
-    # стараемся обрезать только чистый JSON-объект.
-    # Находим позицию возможных маркеров конца полезного JSON.
-    cut_markers = []
-    for marker in ["```", "Дополнительный анализ", "Дополнительный анализ", "---"]:
-        idx = content.find(marker, end + 1)
-        if idx != -1:
-            cut_markers.append(idx)
-    if cut_markers:
-        hard_end = min(cut_markers)
-        # Ищем последнюю '}' перед первым маркером
-        end_before_marker = content.rfind("}", start, hard_end)
-        if end_before_marker != -1 and end_before_marker > start:
-            end = end_before_marker
-
     if start != -1 and end != -1 and end > start:
         return content[start : end + 1]
+
+    # Если вообще не нашли фигурные скобки — возвращаем как есть
     return content
 
 
 def _build_conversation_snippet(
     messages: List[TelegramMessage],
     max_chars: Optional[int] = None,
-    allowed_ids: Optional[set[str]] = None,
+    allowed_ids: Optional[Set[str]] = None,
 ) -> str:
     """
     Готовим компактный текст для LLM: "USER_1: сообщение".
@@ -133,8 +241,7 @@ def _build_conversation_snippet(
         total_len += len(line)
 
     # fallback, если после фильтра по allowed_ids ничего не набрали
-    if not lines:
-        total_len = 0
+    if not lines and messages:
         for msg in messages:
             if not msg.text.strip():
                 continue
@@ -147,13 +254,12 @@ def _build_conversation_snippet(
     return "\n".join(lines)
 
 
-def _build_plain_snippet(text: str, max_chars: Optional[int] = None) -> str:
-    """Для нераспознанного формата."""
+def _build_plain_snippet(chat_text: str, max_chars: Optional[int] = None) -> str:
+    """Простейший fallback, если парсер не смог распознать структуру."""
     if max_chars is None:
         max_chars = settings.llm_max_chars
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    snippet = "\n".join(lines)
-    return snippet[:max_chars]
+
+    return chat_text[:max_chars]
 
 
 def _call_llm(
@@ -166,34 +272,36 @@ def _call_llm(
 ]:
     """Вызывает LLM для анализа и возвращает результат + usage."""
     user_prompt = (
-        "Ниже — анонимизированная переписка между участниками (USER_1, USER_2, и возможно другими).\n"
-        "Твоя задача — на основе стиля сообщений и эмоциональных реакций:\n"
-        "1) Составить развёрнутый психологический портрет КАЖДОГО уникального участника, который присутствует в переписке.\n"
-        "2) Описать динамику их отношений.\n"
-        "3) Дать практические рекомендации по улучшению общения.\n\n"
-        "Используй только информацию из переписки, ничего не придумывай сверх наблюдаемого.\n\n"
-        "ПЕРЕПИСКА:\n" + conversation_snippet
+        "Ниже — анонимизированная переписка между участниками (USER_1, USER_2 и другими).\n"
+        "Проанализируй её и на основе СТИЛЯ общения, эмоций, динамики, реакции участников:\n"
+        "1) Составь психологический портрет КАЖДОГО участника.\n"
+        "2) Опиши динамику их взаимоотношений.\n"
+        "3) Выдели тревожные моменты (red_flags) и здоровые (green_flags).\n"
+        "4) Дай практические, прикладные рекомендации.\n\n"
+        "ОЧЕНЬ ВАЖНО: верни ТОЛЬКО валидный JSON строго по структуре из системной инструкции. "
+        "Никакого текста до JSON и после JSON, никаких комментариев, markdown или пояснений.\n"
     )
 
-    try:
-        completion = client.chat.completions.create(
-            model=settings.openai_model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.4,
-            max_tokens=settings.llm_max_tokens,
-            response_format={"type": "json_object"},
-        )
-    except Exception as exc:
-        logger.exception("OpenAI API call failed: %r", exc)
-        raise RuntimeError(f"Не удалось получить ответ от модели: {exc}") from exc
+    params = {
+        "model": settings.openai_model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT.strip()},
+            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": conversation_snippet},
+        ],
+        # как было раньше — температура 0 для максимально стабильного вывода
+        "temperature": 0.5,
+        "max_tokens": settings.llm_max_tokens,
+    }
+
+    if model_supports_json_format(settings.openai_model):
+        # Для GPT-моделей просим строгий JSON-объект
+        params["response_format"] = {"type": "json_object"}
+
+    completion = client.chat.completions.create(**params)
 
     content = completion.choices[0].message.content
     usage = getattr(completion, "usage", None)
-    
-    # Логируем usage для статистики
     if usage:
         logger.info(
             "LLM usage: prompt_tokens=%d, completion_tokens=%d, total_tokens=%d",
@@ -214,89 +322,27 @@ def _call_llm(
     if not content or not content.strip():
         raise RuntimeError("Модель вернула пустой ответ")
 
+    # Даже если это GPT с json_object, content обычно всё равно строка с JSON
     cleaned = _extract_json_block(content)
 
-    # Попытка "подлечить" JSON-ответ: обрезаем по последней закрывающей скобке
-    last_brace = cleaned.rfind("}")
-    if last_brace != -1:
-        cleaned = cleaned[: last_brace + 1]
-
-    # Если модель оборвала ответ - пытаемся закрыть структуру
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        logger.warning("JSON parse failed, attempting repair: %s", exc)
-        # Проверяем, есть ли все обязательные поля в ответе
-        has_participants = '"participants"' in cleaned
-        has_relationship = '"relationship"' in cleaned
-        has_recommendations = '"recommendations"' in cleaned
-        
-        if has_participants and not (has_relationship and has_recommendations):
-            # Модель оборвала ответ - дописываем недостающие части
-            repaired = cleaned.rstrip()
-            
-            # Убираем незакрытые кавычки/запятые в конце
-            while repaired and repaired[-1] in ('"', ',', ' ', '\n', '\r', '\t'):
-                if repaired[-1] == '"':
-                    # Если есть незакрытая кавычка - убираем её
-                    repaired = repaired[:-1].rstrip()
-                    break
-                repaired = repaired[:-1]
-            
-            # Проверяем, есть ли незакрытое поле "summary" в последнем участнике
-            # Ищем последнее вхождение "summary": "
-            last_summary_start = repaired.rfind('"summary": "')
-            if last_summary_start != -1:
-                # Проверяем, закрыто ли это поле (есть ли закрывающая кавычка после значения)
-                after_summary = repaired[last_summary_start + len('"summary": "'):]
-                # Считаем кавычки с учётом экранирования
-                # Простая проверка: если нет закрывающей кавычки или она не закрыта корректно
-                if not after_summary or after_summary.count('"') == 0:
-                    # summary оборван - добавляем закрывающую кавычку
-                    repaired += '"'
-            
-            # Закрываем все открытые структуры:
-            # 1. Проверяем, есть ли все обязательные поля в последнем участнике
-            # Ищем последнее вхождение "traits"
-            last_traits = repaired.rfind('"traits"')
-            last_summary = repaired.rfind('"summary"')
-            
-            # Если traits есть, но summary после него нет - добавляем пустой summary
-            if last_traits != -1 and (last_summary == -1 or last_summary < last_traits):
-                # Нужно добавить summary перед закрытием объекта участника
-                # Ищем закрывающую скобку traits
-                traits_end = repaired.find('}', last_traits)
-                if traits_end != -1:
-                    # Добавляем запятую после traits и summary
-                    repaired += ',"summary":""'
-            
-            # 2. Закрываем последний объект участника (если он не закрыт)
-            if not repaired.endswith('}'):
-                repaired += '}'
-            
-            # 3. Закрываем массив participants (если он не закрыт)
-            if not ']' in repaired[repaired.rfind('"participants"'):] or repaired.count('[') > repaired.count(']'):
-                repaired += ']'
-            
-            # 4. Добавляем недостающие поля
-            if not has_relationship:
-                repaired += ',"relationship":{"description":"","red_flags":[],"green_flags":[]}'
-            if not has_recommendations:
-                repaired += ',"recommendations":[]'
-            
-            # 5. Закрываем корневой объект
-            if not repaired.endswith('}'):
-                repaired += '}'
-            
-            try:
-                data = json.loads(repaired)
-                logger.info("JSON successfully repaired")
-            except json.JSONDecodeError as repair_exc:
-                logger.exception("JSON repair failed, original cleaned=%r, repaired=%r", cleaned, repaired)
-                raise RuntimeError(f"Модель вернула невалидный JSON: {exc}") from exc
+        logger.exception("JSON decode error from LLM, cleaned=%r", cleaned)
+
+        # Пытаемся автоматически починить типичный случай усечённого конца (нет ]})
+        repaired = _repair_truncated_json(cleaned)
+        if repaired is not None:
+            logger.warning("JSON от LLM был усечён, но успешно восстановлен автоматически (добавили завершающее ]})")
+            data = repaired
         else:
-            logger.exception("JSON decode error from LLM, cleaned=%r", cleaned)
             raise RuntimeError(f"Модель вернула невалидный JSON: {exc}") from exc
+
+    # Если модель по какой-то причине вернула обёртку с полем is_fallback
+    if isinstance(data, dict) and data.get("is_fallback"):
+        raise RuntimeError(
+            f"Модель вернула невалидный JSON: {data.get('error_message', 'Неизвестная ошибка')}"
+        )
 
     participants: List[ParticipantProfile] = []
     for p in data.get("participants", []):
@@ -304,18 +350,24 @@ def _call_llm(
             ParticipantProfile(
                 id=p.get("id") or p.get("display_name") or "USER",
                 display_name=p.get("display_name") or p.get("id") or "USER",
-                traits=p.get("traits", {}),
-                summary=p.get("summary", ""),
+                traits=p.get("traits", {}) or {},
+                summary=p.get("summary", "") or "",
             )
         )
 
     if not participants:
-        logger.error("LLM вернул пустой список participants, data=%r", data)
-        raise RuntimeError("LLM вернул пустой список participants")
+        logger.warning("LLM вернул пустой список participants, используем фолбэк")
+        fallback_participants, fallback_relationship, fallback_recommendations, _ = _build_dummy_response()
+        return (
+            fallback_participants,
+            fallback_relationship,
+            fallback_recommendations,
+            usage_dict,
+        )
 
     rel_raw = data.get("relationship", {}) or {}
     relationship = RelationshipSummary(
-        description=rel_raw.get("description", ""),
+        description=rel_raw.get("description", "") or "",
         red_flags=rel_raw.get("red_flags", []) or [],
         green_flags=rel_raw.get("green_flags", []) or [],
     )
@@ -324,8 +376,8 @@ def _call_llm(
     for r in data.get("recommendations", []):
         recommendations.append(
             Recommendation(
-                title=r.get("title", "Рекомендация"),
-                text=r.get("text", ""),
+                title=r.get("title", "Рекомендация") or "Рекомендация",
+                text=r.get("text", "") or "",
             )
         )
 
@@ -333,11 +385,21 @@ def _call_llm(
 
 
 def _build_dummy_response() -> Tuple[
-    List[ParticipantProfile], RelationshipSummary, List[Recommendation], None
+    List[ParticipantProfile],
+    RelationshipSummary,
+    List[Recommendation],
+    Optional[dict],
 ]:
-    """Заглушка на время разработки."""
-    fallback_text = "Данный анализ не является действительным результатом работы сервиса."
-    
+    """
+    Строит "заглушку" ответа на случай, если LLM не смог дать валидный JSON
+    или случилась ошибка на стороне модели/сети.
+    """
+    fallback_text = (
+        "К сожалению, произошла ошибка при обработке переписки. "
+        "Попробуйте ещё раз чуть позже. Если ошибка повторяется, "
+        "уменьшите объём переписки или сократите вложения."
+    )
+
     dummy_participants = [
         ParticipantProfile(
             id="USER_1",
@@ -345,17 +407,7 @@ def _build_dummy_response() -> Tuple[
             traits={
                 "extroversion": fallback_text,
                 "emotional_stability": fallback_text,
-                "agreeableness": fallback_text,
-            },
-            summary=fallback_text,
-        ),
-        ParticipantProfile(
-            id="USER_2",
-            display_name="USER_2",
-            traits={
-                "extroversion": fallback_text,
-                "emotional_stability": fallback_text,
-                "assertiveness": fallback_text,
+                "other": fallback_text,
             },
             summary=fallback_text,
         ),
@@ -402,17 +454,15 @@ def analyze_chat_text(
     else:
         snippet = _build_plain_snippet(chat_text)
 
-    logger.info(
-        "[analyze_chat_text] snippet_len=%d, total_messages=%d",
-        len(snippet),
-        stats.total_messages,
-    )
+    participants: List[ParticipantProfile] = []
+    relationship: RelationshipSummary
+    recommendations: List[Recommendation] = []
+    token_usage: Optional[dict] = None
 
-    token_usage = None
     is_fallback = False
     error_message = None
-    
-    if settings.use_llm:
+
+    if snippet.strip():
         try:
             participants, relationship, recommendations, token_usage = _call_llm(snippet)
         except Exception as exc:
@@ -433,3 +483,4 @@ def analyze_chat_text(
     )
 
     return response, token_usage
+

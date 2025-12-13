@@ -38,6 +38,21 @@ class Settings(BaseSettings):
     yookassa_shop_id: Optional[str] = None
     yookassa_secret_key: Optional[str] = None
 
+    llm_validate_json: bool = True  # Включает дополнительную валидацию JSON
+    llm_retry_on_failure: int = 1   # Количество попыток при невалидном JSON
+
+
+    @property
+    def llm_model(self) -> str:
+        """Обратная совместимость: старый код может звать settings.llm_model."""
+        return self.openai_model
+
+    @property
+    def llm_temperature(self) -> float:
+        """Обратная совместимость для старого кода."""
+        return 0.0  # детерминированный вывод
+
+
     # Paths
     log_dir: Path = Path("logs")
     
