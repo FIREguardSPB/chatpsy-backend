@@ -1,6 +1,9 @@
 """Analysis routes: /chat_meta and /analyze_chat."""
 import logging
-from fastapi import APIRouter, Depends, HTTPException, Request
+import zipfile
+import io
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
+from fastapi.responses import JSONResponse
 
 from ...config import settings
 from ...core.rate_limiter import rate_limiter
@@ -71,6 +74,69 @@ async def chat_meta(
         snippet_bytes=snippet_bytes,
         recommended_bytes=settings.recommended_bytes,
     )
+
+
+@router.post("/analyze_zip")
+async def analyze_zip(
+    file: UploadFile = File(...),
+    client_ip: str = Depends(get_client_ip),
+):
+    """
+    Обработка ZIP-архива с TXT-файлами чата.
+    Распаковывает архив, проверяет содержимое и объединяет TXT-файлы для анализа.
+    """
+    # Проверяем, что файл является ZIP-архивом
+    if not file.filename.endswith('.zip'):
+        raise HTTPException(status_code=400, detail="Файл должен быть в формате ZIP")
+
+    try:
+        # Читаем содержимое файла
+        contents = await file.read()
+        
+        # Создаем объект BytesIO для работы с содержимым как с файлом в памяти
+        zip_buffer = io.BytesIO(contents)
+        
+        # Открываем ZIP-архив
+        with zipfile.ZipFile(zip_buffer, 'r') as zip_ref:
+            # Получаем список файлов в архиве
+            file_list = zip_ref.namelist()
+            
+            # Проверяем, что в архиве есть хотя бы один файл
+            if not file_list:
+                raise HTTPException(status_code=400, detail="Архив не содержит текстового файла. Пожалуйста, загрузите корректный ZIP-архив с текстовыми файлами.")
+            
+            # Проверяем, что все файлы имеют расширение .txt
+            non_txt_files = [f for f in file_list if not f.lower().endswith('.txt')]
+            if non_txt_files:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Архив не содержит текстового файла. Пожалуйста, загрузите корректный ZIP-архив с текстовыми файлами."
+                )
+            
+            # Читаем и объединяем содержимое всех TXT-файлов
+            combined_content = ""
+            for filename in file_list:
+                # Пропускаем директории
+                if filename.endswith('/'):
+                    continue
+                    
+                # Читаем содержимое файла
+                with zip_ref.open(filename) as f:
+                    content = f.read().decode('utf-8')
+                    combined_content += f"\n\n<!-- FILE: {filename} -->\n\n{content}"
+            
+            # Если содержимое пустое, возвращаем ошибку
+            if not combined_content.strip():
+                raise HTTPException(status_code=400, detail="Архив не содержит текстового файла. Пожалуйста, загрузите корректный ZIP-архив с текстовыми файлами.")
+            
+            # Возвращаем объединенное содержимое для дальнейшей обработки
+            return JSONResponse(content={"chat_text": combined_content})
+            
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Архив не содержит текстового файла. Пожалуйста, загрузите корректный ZIP-архив с текстовыми файлами.")
+    except Exception as e:
+        logger.exception("Ошибка при обработке ZIP-архива")
+        raise HTTPException(status_code=500, detail="Архив не содержит текстового файла. Пожалуйста, загрузите корректный ZIP-архив с текстовыми файлами.")
 
 
 @router.post("/analyze_chat", response_model=AnalyzeResponse)
